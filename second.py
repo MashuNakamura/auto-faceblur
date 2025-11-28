@@ -52,9 +52,9 @@ prev_time = time.time()
 # ============================================================
 # YOLOv11 digunakan untuk deteksi wajah secara cepat.
 # model.pt bisa diganti dengan custom model jika sudah dilatih khusus wajah.
+# model.to('cuda') agar inferensi YOLO berjalan di GPU untuk performa maksimal.
 print("INFO: Loading YOLO...")
 model = YOLO("model.pt")
-# Memaksa YOLO masuk VRAM agar inferensi cepat
 model.to('cuda')
 print("INFO: YOLOv11 model loaded on GPU.")
 
@@ -63,6 +63,7 @@ print("INFO: YOLOv11 model loaded on GPU.")
 # ============================================================
 # Whitelist wajah adalah wajah yang tidak akan diblur.
 # DeepFace digunakan untuk ekstraksi embedding wajah dan membandingkan dengan whitelist.
+# Semua file dalam folder whitelist akan diproses di awal agar runtime lebih cepat.
 print("INFO: Memuat whitelist...")
 whitelist_path = "whitelist/"
 target_embeddings = []
@@ -116,6 +117,10 @@ def is_close(box1, box2, limit=50):
 # ============================================================
 # Membaca frame dari webcam, mendeteksi wajah, melakukan face recognition
 # dan menerapkan blur pada wajah yang tidak ada di whitelist
+# Integrasi YOLO + DeepFace:
+#   1. YOLO untuk deteksi bounding box wajah secara real-time
+#   2. DeepFace untuk ekstraksi embedding dan pengecekan whitelist
+#   3. Tracking dan frame skipping untuk optimasi performa
 cap = cv2.VideoCapture(0)
 frame_count = 0
 tracked_faces = []
@@ -130,7 +135,7 @@ while True:
     # Resize frame agar sesuai resolusi input
     sframe = cv2.resize(frame, INPUT_RES)
 
-    # Hitung FPS
+    # Hitung FPS real-time untuk monitoring performa
     curr_time = time.time()
     fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
     prev_time = curr_time
@@ -140,7 +145,9 @@ while True:
 
     # -------------------------------------------------------
     # DETEKSI WAJAH DENGAN YOLOv11
-    # Gunakan device=0 agar eksplisit menggunakan GPU
+    # device=0 memastikan GPU digunakan
+    # stream=True mengurangi penggunaan memori untuk video loops
+    # verbose=False mengurangi log output yang tidak perlu
     # -------------------------------------------------------
     results = model(sframe, stream=True, verbose=False, device=0)
 
@@ -182,9 +189,9 @@ while True:
             # FACE RECOGNITION DENGAN DEEPFACE
             # - Menggunakan embedding untuk membandingkan dengan whitelist
             # - Hanya dilakukan sesuai SKIP_FRAMES agar lebih efisien
+            # - Konversi ke RGB untuk kompatibilitas DeepFace
             # ---------------------------------------------------
             if needs_recognition and len(target_embeddings) > 0:
-                # Konversi BGR ke RGB untuk DeepFace (hemat I/O tanpa save file)
                 face_img_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
 
                 try:
@@ -210,6 +217,7 @@ while True:
             # VISUALISASI
             # - Blur jika bukan whitelist
             # - Kotak hijau jika whitelist
+            # - Label tambahan bisa ditambahkan di sini jika perlu
             # ---------------------------------------------------
             if not is_whitelisted:
                 sframe[y1:y2, x1:x2] = blur_face(face_img)
@@ -227,5 +235,6 @@ while True:
 # ============================================================
 # CLEANUP
 # ============================================================
+# Tutup kamera dan jendela OpenCV
 cap.release()
 cv2.destroyAllWindows()
