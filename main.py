@@ -5,15 +5,33 @@ from deepface import DeepFace
 import os
 import urllib.request
 import math
+import time
+import tensorflow as tf
 
-# --- 1. CONFIGURATION ---
+# ============================================================
+# 0. Set CPU/GPU
+# ============================================================
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Using CPU
+print("TensorFlow devices:", tf.config.list_physical_devices())
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 SKIP_FRAMES = 30
-THRESHOLD = 0.55
-INPUT_RES = (640, 480)   # Resolusi kamera (Standard VGA)
+THRESHOLD = 0.70   # Facenet512 threshold normal 0.7–1.0
+INPUT_RES = (640, 480)
 
-# --- 2. SETUP MODEL YUNET ---
+fps = 0
+prev_time = time.time()
+
+# ============================================================
+# 2. YUNET SETUP (Face Detection)
+# ============================================================
 yunet_weights = "face_detection_yunet_2023mar.onnx"
-yunet_url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+yunet_url = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/"
+    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
 
 if not os.path.exists(yunet_weights):
     print("INFO: Mengunduh model YuNet...")
@@ -23,170 +41,198 @@ if not os.path.exists(yunet_weights):
         print(f"ERROR: Download gagal: {e}")
         exit()
 
-face_detector = cv2.FaceDetectorYN.create(
-        model=yunet_weights,
-        config="",
-        input_size=INPUT_RES,
-        score_threshold=0.6,
-        nms_threshold=0.3,
-        top_k=5000,
-        backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
-        target_id=cv2.dnn.DNN_TARGET_CPU
-        )
+# CPU backend
+backend_id = cv2.dnn.DNN_BACKEND_OPENCV
+target_id  = cv2.dnn.DNN_TARGET_CPU
 
-# --- 3. LOAD WHITELIST ---
+face_detector = cv2.FaceDetectorYN.create(
+    model=yunet_weights,
+    config="",
+    input_size=INPUT_RES,
+    score_threshold=0.6,
+    nms_threshold=0.3,
+    top_k=5000,
+    backend_id=backend_id,
+    target_id=target_id
+)
+
+# ============================================================
+# 3. LOAD WHITELIST
+# ============================================================
 print("INFO: Memuat whitelist...")
-directory_path = 'whitelist/'
+whitelist_path = "whitelist/"
 target_embeddings = []
 
-if not os.path.exists(directory_path):
-    os.makedirs(directory_path)
+if not os.path.exists(whitelist_path):
+    os.makedirs(whitelist_path)
 
-files = [os.path.join(directory_path, f) for f in os.listdir(directory_path) if os.path.isfile(os.path.join(directory_path, f))]
+files = [
+    os.path.join(whitelist_path, f)
+    for f in os.listdir(whitelist_path)
+    if os.path.isfile(os.path.join(whitelist_path, f))
+]
 
 for img_path in files:
     try:
-        # Gunakan VGG-Face
-        embedding_result = DeepFace.represent(
-                img_path=img_path,
-                model_name="Facenet512",
-                enforce_detection=False
-                )
-        if embedding_result:
-            target_embeddings.append(embedding_result[0]["embedding"])
+        # DeepFace terbaru hanya menerima img_path
+        emb = DeepFace.represent(
+            img_path=img_path,
+            model_name="Facenet512",
+            enforce_detection=True   # auto crop/alignment
+        )
+        if emb:
+            target_embeddings.append(emb[0]["embedding"])
             print(f"  + Loaded: {os.path.basename(img_path)}")
+
     except Exception as e:
         print(f"  - Gagal load {img_path}: {e}")
 
 print(f"INFO: Total {len(target_embeddings)} wajah di whitelist.")
-target_embeddings = np.array(target_embeddings) # Convert ke numpy array untuk performa
+target_embeddings = np.array(target_embeddings)
 
-# --- 4. HELPER FUNCTIONS ---
+# ============================================================
+# 4. HELPER FUNCTIONS
+# ============================================================
 def get_distance(emb1, emb2):
-    """Hitung Cosine Distance antara dua embedding"""
+    """Cosine distance between two embeddings"""
     a = np.matmul(emb1, emb2)
     b = np.linalg.norm(emb1)
     c = np.linalg.norm(emb2)
     return 1 - (a / (b * c))
 
 def is_close(box1, box2, limit=50):
-    """Cek apakah posisi wajah sekarang dekat dengan posisi wajah yang sudah dikenali sebelumnya"""
-    # Hitung titik tengah (centroid)
+    """Check apakah box baru posisinya sama seperti frame sebelumnya"""
     cx1 = box1[0] + (box1[2] // 2)
     cy1 = box1[1] + (box1[3] // 2)
     cx2 = box2[0] + (box2[2] // 2)
     cy2 = box2[1] + (box2[3] // 2)
-
-    dist = math.sqrt((cx1 - cx2)**2 + (cy1 - cy2)**2)
+    dist = math.sqrt((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2)
     return dist < limit
 
-# --- 5. MAIN LOOP ---
+def blur_face(face):
+    """Gaussian blur biasa (CPU)"""
+    return cv2.GaussianBlur(face, (51, 51), 30)
+
+# ============================================================
+# 5. MAIN LOOP
+# ============================================================
 cap = cv2.VideoCapture(0)
 frame_count = 0
-
-# Variabel untuk menyimpan status wajah agar tidak perlu cek tiap frame
-# Format: [{'box': [x,y,w,h], 'status': True/False}]
 tracked_faces = []
 
-print("INFO: Mulai kamera. Tekan 'q' untuk keluar.")
+print("INFO: Kamera berjalan. Tekan 'q' untuk keluar.")
 
 while True:
     ret, frame = cap.read()
-    if not ret: break
+    if not ret:
+        break
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-    if cv2.waitKey(1) & 0xFF == ord('q'): break
+    sframe = cv2.resize(frame, INPUT_RES)
 
-    # Resize frame
-    sframe = cv2.resize(frame, INPUT_RES, interpolation=cv2.INTER_LINEAR)
+    # FPS counter
+    curr_time = time.time()
+    fps = 1 / (curr_time - prev_time)
+    prev_time = curr_time
+
+    cv2.putText(
+        sframe,
+        f"FPS: {fps:.2f}",
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0),
+        2
+    )
+
     h_img, w_img, _ = sframe.shape
     face_detector.setInputSize((w_img, h_img))
 
-    # 1. Deteksi Wajah (Cepat - Jalan tiap frame)
     _, faces = face_detector.detect(sframe)
-
-    current_faces_status = [] # List untuk menyimpan status wajah di frame INI
+    current_faces_status = []
 
     if faces is not None:
         for face in faces:
             box = face[0:4].astype(np.int32)
-            x, y, w, h = max(0, box[0]), max(0, box[1]), min(box[2], w_img-box[0]), min(box[3], h_img-box[1])
-
-            if w <= 0 or h <= 0: continue
+            x, y, w, h = (
+                max(0, box[0]),
+                max(0, box[1]),
+                min(box[2], w_img - box[0]),
+                min(box[3], h_img - box[1])
+            )
+            if w <= 0 or h <= 0:
+                continue
 
             face_img = sframe[y:y+h, x:x+w]
             is_whitelisted = False
 
-            # --- LOGIKA OPTIMASI ---
-            # Kita hanya menjalankan DeepFace (BERAT) jika:
-            # A. Ini adalah frame ke-30 (Scanning ulang berkala)
-            # B. Wajah ini belum ada di data tracking (Wajah baru muncul)
-
+            # ====================================================
+            # FRAME-SKIP LOGIC (OPTIMIZATION)
+            # ====================================================
             needs_recognition = (frame_count % SKIP_FRAMES == 0)
-
-            # Cek apakah wajah ini sudah ada di tracking list sebelumnya?
             matched_prev_status = None
+
             if not needs_recognition:
                 for tf in tracked_faces:
-                    if is_close(box, tf['box']):
-                        matched_prev_status = tf['status']
+                    if is_close(box, tf["box"]):
+                        matched_prev_status = tf["status"]
                         break
-
                 if matched_prev_status is not None:
                     is_whitelisted = matched_prev_status
                 else:
-                    # Jika wajah baru muncul tapi bukan jadwal scan, paksa scan
                     needs_recognition = True
 
-            # --- DEEPFACE RECOGNITION (BERAT) ---
+            # ====================================================
+            # FACE RECOGNITION
+            # ====================================================
             if needs_recognition and len(target_embeddings) > 0:
                 try:
-                    # Visual feedback text "Scanning..."
-                    cv2.putText(sframe, ".", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                    cv2.putText(
+                        sframe, ".", (x, y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 255, 255), 2
+                    )
 
-                    current_res = DeepFace.represent(img_path=face_img, model_name="Facenet512", enforce_detection=False)
-                    if current_res:
-                        curr_emb = current_res[0]["embedding"]
+                    if face_img.size > 0:
+                        # simpan sementara wajah
+                        tmp_path = "./whitelist/tmp_face.jpeg"
+                        cv2.imwrite(tmp_path, face_img)
 
-                        # Cek jarak dengan semua whitelist
-                        min_dist = 100
-                        for target in target_embeddings:
-                            dist = get_distance(target, curr_emb)
-                            if dist < min_dist: min_dist = dist
+                        curr = DeepFace.represent(
+                            img_path=tmp_path,
+                            model_name="Facenet512",
+                            enforce_detection=False
+                        )
 
-                        print(f"DEBUG: Jarak wajah = {min_dist:.4f} (Threshold: {THRESHOLD})")
+                        if curr:
+                            curr_emb = curr[0]["embedding"]
+                            min_dist = min(
+                                get_distance(t, curr_emb)
+                                for t in target_embeddings
+                            )
+                            print(f"DEBUG: Jarak wajah = {min_dist:.4f}")
+                            if min_dist <= THRESHOLD:
+                                is_whitelisted = True
 
-                        if min_dist <= THRESHOLD:
-                            is_whitelisted = True
                 except Exception as e:
-                    pass
+                    print("ERROR RECOG:", e)
 
-            # Simpan status untuk frame berikutnya
-            current_faces_status.append({'box': box, 'status': is_whitelisted})
+            # Save tracking result
+            current_faces_status.append(
+                {"box": box, "status": is_whitelisted}
+            )
 
-            # --- VISUALISASI ---
+            # ====================================================
+            # APPLY BLUR
+            # ====================================================
             if not is_whitelisted:
-                blur_roi = cv2.GaussianBlur(face_img, (51, 51), 30)
-                sframe[y:y+h, x:x+w] = blur_roi
+                blurred = blur_face(face_img)
+                sframe[y:y+h, x:x+w] = blurred
 
-            """
-            if is_whitelisted:
-                # UNLOCK (Hijau)
-                cv2.rectangle(sframe, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                cv2.putText(sframe, "OPEN", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-            else:
-                # LOCKED (Blur)
-                try:
-                    # Blur yang sangat kuat
-                    blur_roi = cv2.GaussianBlur(face_img, (51, 51), 30)
-                    sframe[y:y+h, x:x+w] = blur_roi
-                except: pass
-            """
-
-    # Update tracking list
     tracked_faces = current_faces_status
-
     frame_count += 1
-    cv2.imshow('Smart Face Blur', sframe)
+    cv2.imshow("Smart Face Blur", sframe)
 
 cap.release()
 cv2.destroyAllWindows()

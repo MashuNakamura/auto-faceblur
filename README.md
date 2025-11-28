@@ -1,4 +1,4 @@
-# auto-faceblur
+# auto-faceblur - Computer Vision
 
 Automatically detect and blur faces in images and video using DeepFace and OpenCV.
 
